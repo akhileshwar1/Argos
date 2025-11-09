@@ -11,6 +11,48 @@ use futures_util::{StreamExt};
 use std::sync::{Arc, Mutex};
 use ordered_float::OrderedFloat;
 
+#[derive(Debug, Deserialize)]
+struct CombinedMsg {
+    stream: String,
+    data: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct TradeEvent {
+    e: String,      // "trade"
+    E: i64,         // event time (ms)
+    s: String,      // symbol
+    t: u64,         // trade id
+    p: String,      // price as string
+    q: String,      // qty as string
+    T: i64,         // trade time (ms)
+    m: bool,        // is buyer maker
+    M: bool,
+}
+
+async fn write_trade(pool: &PgPool, sym: &str, te: &TradeEvent) -> Result<()> {
+    let price = te.p.parse::<f64>().unwrap_or(0.0);
+    let qty   = te.q.parse::<f64>().unwrap_or(0.0);
+    let trade_ts = chrono::NaiveDateTime::from_timestamp_opt(te.T / 1000, ((te.T % 1000) as u32) * 1_000_000)
+        .map(|n| chrono::DateTime::<Utc>::from_utc(n, Utc));
+    let event_ts = chrono::NaiveDateTime::from_timestamp_opt(te.E / 1000, ((te.E % 1000) as u32) * 1_000_000)
+        .map(|n| chrono::DateTime::<Utc>::from_utc(n, Utc)).unwrap_or_else(|| chrono::Utc::now());
+
+    let raw = serde_json::to_value(te)?;
+    sqlx::query("INSERT INTO trades(symbol, trade_id, event_time, trade_time, price, qty, is_buyer_maker, raw) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+        .bind(sym)
+        .bind(te.t as i64)
+        .bind(event_ts)
+        .bind(trade_ts)
+        .bind(price)
+        .bind(qty)
+        .bind(te.m)
+        .bind(raw)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct DepthUpdate {
     e: String,
@@ -225,13 +267,140 @@ async fn apply_updates(
     Ok(())
 }
 
+fn spawn_reader_task(
+    mut read: impl futures_util::stream::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send + 'static,
+    buffer: Arc<Mutex<VecDeque<DepthUpdate>>>,
+    pool: PgPool,
+    trade_tx: broadcast::Sender<TradeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(msg_res) = read.next().await {
+            match msg_res {
+                Ok(msg) => {
+                    if !msg.is_text() { continue; }
+                    let txt = match msg.into_text() { Ok(t) => t, Err(_) => continue };
+                    // Try combined wrapper first
+                    if let Ok(c) = serde_json::from_str::<CombinedMsg>(&txt) {
+                        if let Some(data_txt) = c.data.as_object().and_then(|_| Some(c.data.to_string())) {
+                            // parse data_txt as depth or trade
+                            if let Ok(upd) = serde_json::from_str::<DepthUpdate>(&data_txt) {
+                                let mut q = buffer.lock().unwrap();
+                                q.push_back(upd);
+                                continue;
+                            }
+                            if let Ok(tr) = serde_json::from_str::<TradeEvent>(&data_txt) {
+                                let pool_c = pool.clone();
+                                let sym = tr.s.clone();
+                                let tx_clone = trade_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = write_trade(&pool_c, &sym, &tr).await {
+                                        eprintln!("trade write err: {}", e);
+                                    }
+                                    let _ = tx_clone.send(tr);
+                                });
+                                continue;
+                            }
+                        }
+                        continue;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn spawn_snapshot_task(
+    book_arc: Arc<Mutex<InMemoryBook>>,
+    pool: PgPool,
+    symbol: String,
+    interval_secs: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            let (seq_id, bids_copy, asks_copy) = {
+                let b = book_arc.lock().unwrap();
+                (b.update_id, b.bids.clone(), b.asks.clone())
+            };
+            if let Err(e) = write_snapshot(&pool, &symbol, seq_id, &bids_copy, &asks_copy).await {
+                eprintln!("snapshot write error: {}", e);
+            }
+        }
+    })
+}
+
+async fn align_snapshot(
+    client: &reqwest::Client,
+    buffer: &Arc<Mutex<VecDeque<DepthUpdate>>>,
+    book: &Arc<Mutex<InMemoryBook>>,
+    symbol: &str,
+) -> anyhow::Result<()> {
+    const RETRY_MS: u64 = 200;
+    loop {
+        let snap = fetch_snapshot(client, symbol).await?;
+        // peek first buffered event (clone while holding lock briefly)
+        let first_opt = {
+            let q = buffer.lock().unwrap();
+            q.front().cloned()
+        };
+
+        if let Some(first_ev) = first_opt {
+            // snapshot too old: fetch again
+            if snap.lastUpdateId < first_ev.U {
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                continue;
+            }
+
+            // drop any buffered event where u <= lastUpdateId
+            {
+                let mut q = buffer.lock().unwrap();
+                while q.front().map_or(false, |e| e.u <= snap.lastUpdateId) {
+                    q.pop_front();
+                }
+            }
+
+            // peek again after trimming
+            let first_after = {
+                let q = buffer.lock().unwrap();
+                q.front().cloned()
+            };
+
+            if let Some(first_ev) = first_after {
+                // check alignment condition per Binance doc
+                if !(first_ev.U <= snap.lastUpdateId + 1 && first_ev.u >= snap.lastUpdateId + 1) {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                    continue;
+                }
+            } else {
+                // buffer empty (wait for more WS messages)
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                continue;
+            }
+
+            // success: load snapshot under lock and return
+            {
+                let mut b = book.lock().unwrap();
+                b.load_snapshot(snap);
+            }
+            return Ok(());
+        } else {
+            // buffer empty -> wait for websocket to fill it
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok(); // load .env into process env
     // config
     let symbol = "BTCUSDT".to_string(); // uppercase
-    let ws_stream_name = format!("{}@depth@100ms", symbol.to_lowercase());
-    let ws_url = format!("wss://stream.binance.com:9443/ws/{}", ws_stream_name);
+    
+    // combined stream (depth + trade)
+    let streams = format!("{}@depth@100ms/{}@trade", symbol.to_lowercase(), symbol.to_lowercase());
+    let ws_url = format!("wss://stream.binance.com:9443/stream?streams={}", streams);
+
     let client = Client::new();
     let pool = PgPool::connect(std::env::var("DATABASE_URL")?.as_str()).await?;
     let (tx, _rx) = broadcast::channel::<DepthUpdate>(1024);
@@ -248,28 +417,10 @@ async fn main() -> Result<()> {
     // new broadcast channel for compact book events
     let (book_evt_tx, _book_evt_rx) = broadcast::channel::<BookEvent>(1024);
 
-    // spawn a task to read and buffer events
-    {
-        let buf_clone = buffer.clone();
-        tokio::spawn(async move {
-            let mut read = read;
-            while let Some(msg) = read.next().await {
-                match msg {
-                    Ok(m) => {
-                        if m.is_text() {
-                            if let Ok(txt) = m.into_text() {
-                                if let Ok(ev) = serde_json::from_str::<DepthUpdate>(&txt) {
-                                    let mut q = buf_clone.lock().unwrap();
-                                    q.push_back(ev);
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
+    // new broadcast channel for compact trade events
+    let (trade_tx, _trade_rx) = broadcast::channel::<TradeEvent>(1024);
+
+    let reader_handle = spawn_reader_task(read, buffer.clone(), pool.clone(), trade_tx.clone());
 
     let book_for_snap = book.clone();
     let pool_for_snap = pool.clone();
@@ -287,57 +438,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // fetch snapshot and align
-    loop {
-        let snap = fetch_snapshot(&client, &symbol).await?;
-        // peek first buffered event (clone it out while holding lock briefly)
-        let first_opt = {
-            let q = buffer.lock().unwrap();
-            q.front().cloned()
-        };
-        if let Some(first_ev) = first_opt {
-            if snap.lastUpdateId < first_ev.U {
-                // snapshot too old: fetch again
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                continue;
-            }
-            // drop any buffered event where u <= lastUpdateId
-            {
-                let mut q = buffer.lock().unwrap();
-                while q.front().map_or(false, |e| e.u <= snap.lastUpdateId) {
-                    q.pop_front();
-                }
-            }
-
-            // peek again
-            let first_after = {
-                let q = buffer.lock().unwrap();
-                q.front().cloned()
-            };
-
-            if let Some(first_ev) = first_after {
-                if !(first_ev.U <= snap.lastUpdateId + 1 && first_ev.u >= snap.lastUpdateId + 1) {
-                    // not aligned; refetch snapshot
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    continue;
-                }
-            } else {
-                // no buffered events yet; wait briefly for websocket to fill buffer
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                continue;
-            }
-
-            // success: load snapshot to book
-            {
-                let mut b = book.lock().unwrap();
-                b.load_snapshot(snap);
-            }
-            break;
-        } else {
-            // buffer empty: wait for ws messages
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
+    align_snapshot(&client, &buffer, &book, &symbol).await?;
 
     // apply buffered events then continue processing live
     apply_updates(&book, &buffer, &pool, &tx, &book_evt_tx, &symbol).await?;
