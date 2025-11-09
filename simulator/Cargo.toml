@@ -20,9 +20,12 @@ sqlx = { version = "0.7.4", default-features = false, features = [
     "postgres", 
     "uuid", 
     "chrono", 
+    "json",
     "tls-rustls" 
 ]}
 rand = "0.8"
 uuid = { version = "1.6", features = ["v4"] }
 
-# Simple TUI (lightweight): we'll just use terminal printing, no heavy crates required.
+# TUI
+ratatui = "0.25"
+crossterm = "0.27"
