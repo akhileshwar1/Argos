@@ -310,26 +310,6 @@ fn spawn_reader_task(
     })
 }
 
-fn spawn_snapshot_task(
-    book_arc: Arc<Mutex<InMemoryBook>>,
-    pool: PgPool,
-    symbol: String,
-    interval_secs: u64,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-            let (seq_id, bids_copy, asks_copy) = {
-                let b = book_arc.lock().unwrap();
-                (b.update_id, b.bids.clone(), b.asks.clone())
-            };
-            if let Err(e) = write_snapshot(&pool, &symbol, seq_id, &bids_copy, &asks_copy).await {
-                eprintln!("snapshot write error: {}", e);
-            }
-        }
-    })
-}
-
 async fn align_snapshot(
     client: &reqwest::Client,
     buffer: &Arc<Mutex<VecDeque<DepthUpdate>>>,
