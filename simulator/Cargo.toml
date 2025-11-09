@@ -1,0 +1,28 @@
+[package]
+name = "simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+csv = "1.1"
+ordered-float = "3.4"
+futures-util = "0.3"
+dotenvy = "0.15"
+# optional DB support (enable if you want sqlx)
+sqlx = { version = "0.7.4", default-features = false, features = [
+    "runtime-tokio", 
+    "macros", 
+    "postgres", 
+    "uuid", 
+    "chrono", 
+    "tls-rustls" 
+]}
+rand = "0.8"
+uuid = { version = "1.6", features = ["v4"] }
+
+# Simple TUI (lightweight): we'll just use terminal printing, no heavy crates required.

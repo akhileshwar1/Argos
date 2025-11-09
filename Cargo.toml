@@ -3,6 +3,7 @@ members = [
   "core",
   "ingester",
   "db",
+  "simulator",
 ]
 
 [workspace.dependencies]
