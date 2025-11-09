@@ -2,11 +2,7 @@
 members = [
   "core",
   "ingester",
-  "replayer",
-  "strategy",
-  "shadow_oms",
   "db",
-  "tools/tui",
 ]
 
 [workspace.dependencies]
