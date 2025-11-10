@@ -41,9 +41,8 @@ pub struct BookEvent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Bar {
+pub struct Bar_15m {
     pub symbol: String,
-    pub tf: String,
     pub ts: DateTime<Utc>,
     pub o: f64,
     pub h: f64,
@@ -76,5 +75,5 @@ pub enum MarketEvent {
     Depth(DepthUpdate),
     Trade(TradeEvent),
     Book(BookEvent),
-    Bar(Bar),
+    Bar_15m(Bar_15m),
 }

@@ -7,7 +7,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap, Table, Row, Cell},
     layout::{Constraint, Direction, Layout},
     Terminal, Frame,
-    style::{Style, Modifier},
 };
 use crossterm::{
     event::{self, Event as CEvent, KeyCode, KeyEvent},
@@ -19,18 +18,23 @@ use std::{io, sync::{Arc, Mutex}, time::Duration};
 use tokio::time::sleep;
 use ratatui::backend::Backend;
 
+const MAX_TRADES: usize = 200;
+const MAX_FILLS: usize = 200;
+const MAX_ORDERS: usize = 500;
+const FEE_RATE: f64 = 0.001; // 0.1% per side
+
 pub async fn run_tui(
     mut evt_rx: Receiver<MarketEvent>,
     mut fill_rx: Receiver<Fill>,
     mut order_rx: Receiver<OrderIntent>,
 ) -> Result<()> {
-    // caches
+    // caches (shared with background collectors)
     let trades = Arc::new(Mutex::new(Vec::<TradeEvent>::new()));
     let fills = Arc::new(Mutex::new(Vec::<Fill>::new()));
     let top_book = Arc::new(Mutex::new(None::<BookEvent>));
     let orders = Arc::new(Mutex::new(Vec::<OrderIntent>::new()));
 
-    // spawn background collector for market events (trades + book)
+    // background: market events (trades + book)
     {
         let trades = trades.clone();
         let top_book = top_book.clone();
@@ -40,7 +44,7 @@ pub async fn run_tui(
                     MarketEvent::Trade(t) => {
                         let mut tv = trades.lock().unwrap();
                         tv.push(t);
-                        if tv.len() > 200 { tv.remove(0); }
+                        if tv.len() > MAX_TRADES { tv.remove(0); }
                     }
                     MarketEvent::Book(b) => {
                         let mut tb = top_book.lock().unwrap();
@@ -59,7 +63,7 @@ pub async fn run_tui(
             while let Ok(f) = fill_rx.recv().await {
                 let mut fv = fills.lock().unwrap();
                 fv.push(f);
-                if fv.len() > 200 { fv.remove(0); }
+                if fv.len() > MAX_FILLS { fv.remove(0); }
             }
         });
     }
@@ -71,7 +75,7 @@ pub async fn run_tui(
             while let Ok(o) = order_rx.recv().await {
                 let mut ov = orders.lock().unwrap();
                 ov.push(o);
-                if ov.len() > 500 { ov.remove(0); }
+                if ov.len() > MAX_ORDERS { ov.remove(0); }
             }
         });
     }
@@ -83,10 +87,10 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // main UI loop
     loop {
         // draw UI
         {
-            // borrow caches for rendering
             let tv = trades.lock().unwrap();
             let fv = fills.lock().unwrap();
             let ov = orders.lock().unwrap();
@@ -96,12 +100,29 @@ pub async fn run_tui(
             })?;
         }
 
-        // input handling
+        // input handling with non-blocking poll
         let timeout = Duration::from_millis(100);
         if crossterm::event::poll(timeout)? {
             if let CEvent::Key(KeyEvent{code, ..}) = event::read()? {
                 match code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => {
+                        // on quit: compute and print final report, then exit loop
+                        let tv = trades.lock().unwrap().clone();
+                        let fv = fills.lock().unwrap().clone();
+                        let ov = orders.lock().unwrap().clone();
+                        // restore terminal before printing long text
+                        disable_raw_mode()?;
+                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                        terminal.show_cursor()?;
+                        print_report(&ov, &fv);
+                        return Ok(());
+                    }
+                    KeyCode::Char('r') => {
+                        // on 'r' print a quick report to stdout (non-intrusive)
+                        let ov = orders.lock().unwrap().clone();
+                        let fv = fills.lock().unwrap().clone();
+                        print_report_compact(&ov, &fv);
+                    }
                     KeyCode::Char(' ') => { /* toggle pause - not implemented */ }
                     _ => {}
                 }
@@ -110,21 +131,15 @@ pub async fn run_tui(
 
         sleep(Duration::from_millis(50)).await;
     }
-
-    // restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
 }
 
-// Note: Frame<'a> in this ratatui version has only a lifetime parameter (no Backend generic).
+/// core UI drawing using ratatui widgets
 fn draw_ui(f: &mut Frame<'_>, trades: &Vec<TradeEvent>, fills: &Vec<Fill>, orders: &Vec<OrderIntent>, top_book: Option<&BookEvent>) {
     let size = f.size();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([Constraint::Length(3), Constraint::Percentage(50), Constraint::Length(10)].as_ref())
+        .constraints([Constraint::Length(3), Constraint::Percentage(55), Constraint::Length(10)].as_ref())
         .split(size);
 
     // header (show top-of-book if present)
@@ -151,25 +166,201 @@ fn draw_ui(f: &mut Frame<'_>, trades: &Vec<TradeEvent>, fills: &Vec<Fill>, order
         ])
     }).collect();
 
-    // widths for table columns
     let widths = vec![Constraint::Length(12), Constraint::Length(12), Constraint::Length(12), Constraint::Length(12)];
-    // Table::new(rows, widths) required by this ratatui version
     let table = Table::new(rows, widths).block(Block::default().borders(Borders::ALL).title("Trades"));
     f.render_widget(table, mid_chunks[0]);
 
     // fills & orders pane
     let mut lines = vec![];
+    lines.push(format!("Recent fills (latest {}):", fills.len().min(8)));
     for fll in fills.iter().rev().take(8) {
-        lines.push(format!("Fill {} {}@{:.2} qty={:.6}", fll.order_id, fll.symbol, fll.price, fll.qty));
+        lines.push(format!("{} {} @ {:.2} qty={:.6}", &fll.order_id[..8.min(fll.order_id.len())], fll.symbol, fll.price, fll.qty));
     }
     lines.push("---- Orders (latest) ----".to_string());
     for ord in orders.iter().rev().take(8) {
-        lines.push(format!("Ord {} {} {} qty={:.6}", &ord.id[..8], ord.symbol, ord.side, ord.qty));
+        lines.push(format!("{} {} {} qty={:.6}", &ord.id[..8.min(ord.id.len())], ord.symbol, ord.side, ord.qty));
     }
     let para = Paragraph::new(lines.join("\n")).block(Block::default().borders(Borders::ALL).title("Fills / Orders")).wrap(Wrap { trim: true });
     f.render_widget(para, mid_chunks[1]);
 
-    // bottom: controls
-    let hints = Paragraph::new("Controls: q=quit, space=play/pause").block(Block::default().borders(Borders::ALL).title("Controls"));
+    // bottom: controls + quick stats
+    let stats = format!("Controls: q=quit+report, r=print compact report, space=play/pause | fills={} orders={}", fills.len(), orders.len());
+    let hints = Paragraph::new(stats).block(Block::default().borders(Borders::ALL).title("Controls / Stats"));
     f.render_widget(hints, chunks[2]);
+}
+
+/// Compact on-demand report (prints short summary)
+fn print_report_compact(orders: &Vec<OrderIntent>, fills: &Vec<Fill>) {
+    let (closed_trades, total_pnl, wins, losses) = build_trade_report(orders, fills);
+    println!("----- Compact report -----");
+    println!("Closed trades: {}  Total PnL: {:.6}", closed_trades.len(), total_pnl);
+    println!("Wins: {}  Losses: {}", wins, losses);
+    if !closed_trades.is_empty() {
+        println!("Last closed trade: entry={} exit={} qty={} pnl={:.6}", 
+            closed_trades.last().unwrap().entry_id, closed_trades.last().unwrap().exit_id, closed_trades.last().unwrap().qty, closed_trades.last().unwrap().pnl);
+    }
+    println!("--------------------------");
+}
+
+/// Full report printed at exit
+fn print_report(orders: &Vec<OrderIntent>, fills: &Vec<Fill>) {
+    let (closed_trades, total_pnl, wins, losses) = build_trade_report(orders, fills);
+
+    println!();
+    println!("================ FINAL REPORT ================");
+    println!("Closed trades: {}", closed_trades.len());
+    println!("Total realized PnL: {:.8}", total_pnl);
+    println!("Wins: {}  Losses: {}  Win rate: {:.2}%", wins, losses, 
+        if closed_trades.is_empty() { 0.0 } else { 100.0 * (wins as f64) / (closed_trades.len() as f64) });
+    // max drawdown on cumulative pnl timeline
+    let mut cum = 0.0;
+    let mut peak = std::f64::NEG_INFINITY;
+    let mut max_dd = 0.0;
+    for ct in &closed_trades {
+        cum += ct.pnl;
+        if cum > peak { peak = cum; }
+        let dd = peak - cum;
+        if dd > max_dd { max_dd = dd; }
+    }
+    println!("Max drawdown (realized sequence): {:.8}", max_dd);
+
+    println!();
+    println!("Per-trade summary (most recent 40):");
+    for t in closed_trades.iter().rev().take(40) {
+        println!(
+            "{} -> {}  qty={:.6} entry={:.6} exit={:.6} pnl={:.8}",
+            &t.entry_id[..8.min(t.entry_id.len())],
+            &t.exit_id[..8.min(t.exit_id.len())],
+            t.qty, t.entry_price, t.exit_price, t.pnl
+        );
+    }
+    println!("==============================================");
+}
+
+/// Closed trade record returned by FIFO matcher
+struct ClosedTrade {
+    entry_id: String,
+    exit_id: String,
+    entry_price: f64,
+    exit_price: f64,
+    qty: f64,
+    pnl: f64,
+}
+
+/// Build closed trades using FIFO matching between fills and orders.
+/// Returns (closed_trades, total_realized_pnl, wins, losses)
+fn build_trade_report(orders: &Vec<OrderIntent>, fills: &Vec<Fill>) -> (Vec<ClosedTrade>, f64, usize, usize) {
+    use std::collections::VecDeque;
+
+    // map order_id -> OrderIntent for side lookup
+    let mut order_map = std::collections::HashMap::new();
+    for o in orders {
+        order_map.insert(o.id.clone(), o.clone());
+    }
+
+    // We'll maintain a FIFO list of open lots (symbol-agnostic here; you can extend per-symbol).
+    // Each lot: (qty_signed, price, order_id)
+    // buy fills => positive qty, sell fills => negative qty
+    let mut open_lots: VecDeque<(f64, f64, String)> = VecDeque::new();
+    let mut closed: Vec<ClosedTrade> = Vec::new();
+
+    for f in fills {
+        let order = order_map.get(&f.order_id);
+        // if order missing, skip
+        let side = order.map(|o| o.side.as_str()).unwrap_or("");
+        let fill_qty = f.qty;
+        let fill_price = f.price;
+        // signed qty: buy => +qty, sell => -qty
+        let signed_qty = match side {
+            "buy" | "Buy" | "BUY" => fill_qty,
+            "sell" | "Sell" | "SELL" => -fill_qty,
+            _ => {
+                // unknown: infer by sign of qty (assume positive => buy)
+                fill_qty
+            }
+        };
+
+        // apply fee per side (deduct from pnl when closing). We'll account fee at match time.
+        let mut remaining = signed_qty;
+        if remaining == 0.0 { continue; }
+
+        // if same sign as tail (i.e., adding to existing direction), just push as new open lot
+        if open_lots.is_empty() || open_lots.back().map(|(q,_,_)| q.signum()) == Some(remaining.signum()) {
+            open_lots.push_back((remaining.abs() * remaining.signum(), fill_price, f.order_id.clone()));
+            continue;
+        }
+
+        // Otherwise match against opposite-signed open lots FIFO
+        while remaining.abs() > 0.0 && !open_lots.is_empty() {
+            let mut front = open_lots.pop_front().unwrap();
+            let front_qty = front.0; // signed
+                                     // if front and remaining are opposite sign, match
+            if front_qty.signum() == remaining.signum() {
+                // same sign (shouldn't happen because handled above), push back and break
+                open_lots.push_front(front);
+                break;
+            }
+            let match_qty = remaining.abs().min(front_qty.abs());
+            // determine entry & exit: entry is the lot that was earlier (front), exit is current fill if signs opposite
+            let (entry_price, exit_price, entry_id, exit_id, qty_matched) = if front_qty > 0.0 && remaining < 0.0 {
+                // front was buy, current is sell => closing long
+                (front.1, fill_price, front.2.clone(), f.order_id.clone(), match_qty)
+            } else if front_qty < 0.0 && remaining > 0.0 {
+                // front was short (negative), current is buy => closing short
+                (front.1, fill_price, front.2.clone(), f.order_id.clone(), match_qty)
+            } else {
+                // shouldn't reach
+                (front.1, fill_price, front.2.clone(), f.order_id.clone(), match_qty)
+            };
+
+            // fees: both sides pay fee on their side when executed; compute fees on both entry & exit
+            let fee_entry = entry_price * qty_matched * FEE_RATE;
+            let fee_exit = exit_price * qty_matched * FEE_RATE;
+
+            // pnl: for long-close: (exit - entry) * qty - fees_total
+            let pnl = (exit_price - entry_price) * qty_matched - (fee_entry + fee_exit);
+
+            closed.push(ClosedTrade {
+                entry_id,
+                exit_id,
+                entry_price,
+                exit_price,
+                qty: qty_matched,
+                pnl,
+            });
+
+            // reduce remaining and front lot
+            remaining = if remaining.abs() > match_qty {
+                // subtract matched qty keeping sign
+                let sign = remaining.signum();
+                (remaining.abs() - match_qty) * sign
+            } else {
+                0.0
+            };
+
+            let front_remaining = if front_qty.abs() > match_qty {
+                let sign = front_qty.signum();
+                (front_qty.abs() - match_qty) * sign
+            } else {
+                0.0
+            };
+
+            if front_remaining.abs() > 0.0 {
+                // push leftover front back to front of queue
+                open_lots.push_front((front_remaining, front.1, front.2));
+            }
+        }
+
+        // if any remaining after matching, push it as open lot
+        if remaining.abs() > 0.0 {
+            open_lots.push_back((remaining, fill_price, f.order_id.clone()));
+        }
+    }
+
+    // aggregate
+    let total_pnl: f64 = closed.iter().map(|c| c.pnl).sum();
+    let wins = closed.iter().filter(|c| c.pnl > 0.0).count();
+    let losses = closed.iter().filter(|c| c.pnl <= 0.0).count();
+
+    (closed, total_pnl, wins, losses)
 }
