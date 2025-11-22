@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc, Datelike, Timelike};
 use futures_util::StreamExt;
 use ordered_float::OrderedFloat;
 use reqwest::Client;
@@ -135,7 +135,7 @@ impl BarState {
             start,
         }
     }
-    fn reset(&mut self, start: DateTime<Utc>) {
+    fn reset_to(&mut self, start: DateTime<Utc>) {
         self.open = 0.0;
         self.high = f64::MIN;
         self.low = f64::MAX;
@@ -143,7 +143,38 @@ impl BarState {
         self.vol = 0.0;
         self.start = start;
     }
-    fn observe_trade(&mut self, price: f64, qty: f64) {
+    /// Observe a trade at given trade_ts. If the trade belongs to a different
+    /// 15m bucket than current bar, the previous completed bar is returned for persistence.
+    fn observe_trade(
+        &mut self,
+        price: f64,
+        qty: f64,
+        trade_ts: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, f64, f64, f64, f64, f64)> {
+        let bucket = floor_to_15(trade_ts);
+        if !self.is_active() {
+            // start a new bucket
+            self.start = bucket;
+            self.open = price;
+            self.high = price;
+            self.low = price;
+            self.close = price;
+            self.vol = qty;
+            return None;
+        }
+        if bucket != self.start {
+            // close current bar and start a new one
+            let completed = (self.start, self.open, self.high, self.low, self.close, self.vol);
+            // initialize new bar with current trade
+            self.start = bucket;
+            self.open = price;
+            self.high = price;
+            self.low = price;
+            self.close = price;
+            self.vol = qty;
+            return Some(completed);
+        }
+        // same bucket - accumulate
         if self.open == 0.0 {
             self.open = price;
         }
@@ -155,10 +186,25 @@ impl BarState {
         }
         self.close = price;
         self.vol += qty;
+        None
     }
     fn is_active(&self) -> bool {
         self.open != 0.0
     }
+}
+
+fn floor_to_15(dt: DateTime<Utc>) -> DateTime<Utc> {
+    let minute = dt.minute();
+    let floored_min = (minute / 15) * 15;
+    let y = dt.year();
+    let m = dt.month();
+    let d = dt.day();
+    let hour = dt.hour();
+    // construct new DateTime with seconds/nanos zeroed
+    let s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:00Z", y, m, d, hour, floored_min);
+    DateTime::parse_from_rfc3339(&s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(dt) // fallback (shouldn't happen)
 }
 
 // ----- helpers: DB writes -----
@@ -166,6 +212,7 @@ impl BarState {
 async fn write_trade(pool: &PgPool, sym: &str, te: &TradeEvent) -> Result<()> {
     let price = te.p.parse::<f64>().unwrap_or(0.0);
     let qty = te.q.parse::<f64>().unwrap_or(0.0);
+    println!("writing trade with {price} and {qty}");
     let trade_ts = NaiveDateTime::from_timestamp_opt(te.T / 1000, ((te.T % 1000) as u32) * 1_000_000)
         .map(|n| DateTime::<Utc>::from_naive_utc_and_offset(n, Utc));
     let event_ts = NaiveDateTime::from_timestamp_opt(te.E / 1000, ((te.E % 1000) as u32) * 1_000_000)
@@ -312,14 +359,36 @@ fn spawn_reader_task(
                         if let Ok(tr) = serde_json::from_str::<TradeEvent>(&data) {
                             let pool_c = pool.clone();
                             let sym = symbol.clone();
-                            // write trade and update bar state
-                            let price = tr.p.parse::<f64>().unwrap_or(0.0);
-                            let qty = tr.q.parse::<f64>().unwrap_or(0.0);
+                            // write trade (async, not blocking reader)
+                            let tr_for_write = tr.clone();
                             tokio::spawn(async move {
-                                let _ = write_trade(&pool_c, &sym, &tr).await;
+                                let _ = write_trade(&pool_c, &sym, &tr_for_write).await;
                             });
-                            let mut bs = bar_state.lock().unwrap();
-                            bs.observe_trade(price, qty);
+
+                            // parse trade timestamp
+                            let trade_ts_opt = NaiveDateTime::from_timestamp_opt(tr.T / 1000, ((tr.T % 1000) as u32) * 1_000_000)
+                                .map(|n| DateTime::<Utc>::from_naive_utc_and_offset(n, Utc))
+                                .unwrap_or_else(Utc::now);
+
+                            // observe trade and handle bar rollovers without awaiting in the lock
+                            let maybe_completed = {
+                                let mut bs = bar_state.lock().unwrap();
+                                let price = tr.p.parse::<f64>().unwrap_or(0.0);
+                                let qty = tr.q.parse::<f64>().unwrap_or(0.0);
+                                bs.observe_trade(price, qty, trade_ts_opt)
+                            };
+
+                            if let Some((start, open, high, low, close, vol)) = maybe_completed {
+                                // spawn an async task to persist the completed bar
+                                let pool_c = pool.clone();
+                                let sym = symbol.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = write_bar(&pool_c, &sym, start, open, high, low, close, vol).await {
+                                        eprintln!("write_bar err: {}", e);
+                                    }
+                                });
+                            }
+
                             continue;
                         }
                     }
@@ -351,11 +420,26 @@ async fn process_pending_updates(
 }
 
 async fn maybe_close_bar(bar_state: &Arc<Mutex<BarState>>, pool: &PgPool, symbol: &str) -> Result<()> {
-    let mut bs = bar_state.lock().unwrap();
-    if bs.is_active() && (Utc::now() - bs.start) >= Duration::minutes(15) {
-        // persist on close
-        write_bar(pool, symbol, bs.start, bs.open, bs.high, bs.low, bs.close, bs.vol).await?;
-        bs.reset(Utc::now());
+    // safety flush: if an active bar's bucket is older than now (no new trades), close it.
+    let maybe_completed = {
+        let mut bs = bar_state.lock().unwrap();
+        if bs.is_active() {
+            let bucket_end = bs.start + Duration::minutes(15);
+            if Utc::now() >= bucket_end {
+                let completed = (bs.start, bs.open, bs.high, bs.low, bs.close, bs.vol);
+                // reset bs start to current floored bucket (ready for future trades)
+                bs.reset_to(floor_to_15(Utc::now()));
+                Some(completed)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some((start, open, high, low, close, vol)) = maybe_completed {
+        write_bar(pool, symbol, start, open, high, low, close, vol).await?;
     }
     Ok(())
 }
